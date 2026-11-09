@@ -27,6 +27,7 @@
 #include "zenoh-pico/protocol/definitions/network.h"
 #include "zenoh-pico/protocol/definitions/transport.h"
 #include "zenoh-pico/protocol/iobuf.h"
+#include "zenoh-pico/session/interest.h"
 #include "zenoh-pico/session/utils.h"
 #include "zenoh-pico/system/common/platform.h"
 #include "zenoh-pico/transport/multicast/rx.h"
@@ -439,6 +440,7 @@ static z_result_t _z_multicast_handle_join_inner(_z_transport_multicast_t *ztm, 
             _z_connectivity_peer_event_data_copy_from_common(&disconnected_peer, &entry->common);
 #endif
             // TODO: cleanup here should also be done on mappings/subs/etc...
+            _z_interest_peer_disconnected(_z_transport_common_get_session(&ztm->_common), &entry->common);
             _z_transport_peer_multicast_slist_drop_first_filter(ztm->_peers, _z_transport_peer_multicast_eq, entry);
 #if Z_FEATURE_CONNECTIVITY == 1
             _z_transport_peer_mutex_unlock(&ztm->_common);
@@ -521,6 +523,7 @@ z_result_t _z_multicast_handle_transport_message(_z_transport_multicast_t *ztm, 
                 _z_transport_get_link_properties(&ztm->_common, &mtu, &is_streamed, &is_reliable);
                 _z_connectivity_peer_event_data_copy_from_common(&disconnected_peer, &entry->common);
 #endif
+                _z_interest_peer_disconnected(_z_transport_common_get_session(&ztm->_common), &entry->common);
                 ztm->_peers = _z_transport_peer_multicast_slist_drop_first_filter(
                     ztm->_peers, _z_transport_peer_multicast_eq, entry);
 #if Z_FEATURE_CONNECTIVITY == 1

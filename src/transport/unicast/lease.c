@@ -74,6 +74,14 @@ z_result_t _zp_unicast_send_keep_alive(_z_transport_unicast_t *ztu) {
 
 _z_fut_fn_result_t _zp_unicast_failed_result(_z_transport_unicast_t *ztu, _z_executor_t *executor) {
     _z_session_t *zs = _z_transport_common_get_session(&ztu->_common);
+    // Drop the declarations of the peers of the failed transport, since they are about to be freed
+    _z_transport_peer_mutex_lock(&ztu->_common);
+    _z_transport_peer_unicast_slist_t *it = ztu->_peers;
+    while (it != NULL) {
+        _z_interest_peer_disconnected(zs, &_z_transport_peer_unicast_slist_value(it)->common);
+        it = _z_transport_peer_unicast_slist_next(it);
+    }
+    _z_transport_peer_mutex_unlock(&ztu->_common);
 #if Z_FEATURE_LIVELINESS == 1 && Z_FEATURE_SUBSCRIPTION == 1
     _z_liveliness_subscription_undeclare_all(zs);
 #endif

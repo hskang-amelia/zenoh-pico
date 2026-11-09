@@ -26,12 +26,30 @@ typedef struct _z_session_t _z_session_t;
 
 #if Z_FEATURE_LIVELINESS == 1
 
+// A token declared by a remote node. Token ids are only unique per remote node, so a remote token is identified
+// by the (peer, id) pair.
+typedef struct {
+    _z_keyexpr_t _key;
+    _z_transport_peer_common_t *_peer;
+    uint32_t _id;
+} _z_remote_token_t;
+
+void _z_remote_token_clear(_z_remote_token_t *token);
+size_t _z_remote_token_size(_z_remote_token_t *token);
+void _z_remote_token_copy(_z_remote_token_t *dst, const _z_remote_token_t *src);
+bool _z_remote_token_eq(const _z_remote_token_t *left, const _z_remote_token_t *right);
+_Z_ELEM_DEFINE(_z_remote_token, _z_remote_token_t, _z_remote_token_size, _z_remote_token_clear, _z_remote_token_copy,
+               _z_noop_move, _z_remote_token_eq, _z_noop_cmp, _z_noop_hash)
+_Z_SLIST_DEFINE(_z_remote_token, _z_remote_token_t, true)
+
 typedef struct {
     _z_keyexpr_t _key;
     uint32_t _id;
     _z_closure_reply_callback_t _callback;
     _z_drop_handler_t _dropper;
     void *_arg;
+    z_clock_t _start_time;
+    uint64_t _timeout;
 #ifdef Z_FEATURE_UNSTABLE_API
     _z_pending_query_cancellation_data_t _cancellation_data;
 #endif
@@ -48,17 +66,17 @@ _Z_ELEM_DEFINE(_z_liveliness_pending_query, _z_liveliness_pending_query_t, _z_no
                _z_liveliness_pending_query_clear, _z_noop_copy, _z_noop_move, _z_noop_eq, _z_noop_cmp, _z_noop_hash)
 _Z_INT_MAP_DEFINE(_z_liveliness_pending_query, _z_liveliness_pending_query_t)
 
-#if Z_FEATURE_SUBSCRIPTION == 1
 z_result_t _z_liveliness_process_remote_token_declare(_z_session_t *zn, uint32_t id, const _z_wireexpr_t *keyexpr,
                                                       const _z_timestamp_t *timestamp,
                                                       _z_transport_peer_common_t *peer);
-z_result_t _z_liveliness_process_remote_token_undeclare(_z_session_t *zn, uint32_t id, const _z_timestamp_t *timestamp);
+z_result_t _z_liveliness_process_remote_token_undeclare(_z_session_t *zn, uint32_t id, const _z_timestamp_t *timestamp,
+                                                        _z_transport_peer_common_t *peer);
 z_result_t _z_liveliness_subscription_undeclare_all(_z_session_t *zn);
-#endif
 
 #if Z_FEATURE_QUERY == 1
 _z_liveliness_pending_query_t *_z_unsafe_liveliness_register_pending_query(_z_session_t *zn);
 z_result_t _z_liveliness_unregister_pending_query(_z_session_t *zn, uint32_t id);
+void _z_liveliness_pending_query_process_timeout(_z_session_t *zn);
 #endif
 
 void _z_liveliness_init(_z_session_t *zn);
@@ -67,8 +85,11 @@ void _z_liveliness_clear(_z_session_t *zn);
 
 z_result_t _z_liveliness_process_token_declare(_z_session_t *zn, const _z_n_msg_declare_t *decl,
                                                _z_transport_peer_common_t *peer);
-z_result_t _z_liveliness_process_token_undeclare(_z_session_t *zn, const _z_n_msg_declare_t *decl);
+z_result_t _z_liveliness_process_token_undeclare(_z_session_t *zn, const _z_n_msg_declare_t *decl,
+                                                 _z_transport_peer_common_t *peer);
 z_result_t _z_liveliness_process_declare_final(_z_session_t *zn, const _z_n_msg_declare_t *decl);
+// Drop all the tokens declared by a disconnected peer, notifying liveliness subscribers as for an undeclaration.
+void _z_liveliness_peer_disconnected(_z_session_t *zn, _z_transport_peer_common_t *peer);
 
 #ifdef __cplusplus
 }

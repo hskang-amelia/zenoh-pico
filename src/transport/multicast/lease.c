@@ -48,6 +48,14 @@ z_result_t _zp_multicast_send_keep_alive(_z_transport_multicast_t *ztm) {
 _z_fut_fn_result_t _zp_multicast_failed_result(_z_transport_multicast_t *ztm, _z_executor_t *executor) {
     _z_session_t *session = _z_transport_common_get_session(&ztm->_common);
 
+    // Drop the declarations of the peers of the failed transport, since they are about to be freed
+    _z_transport_peer_mutex_lock(&ztm->_common);
+    _z_transport_peer_multicast_slist_t *it = ztm->_peers;
+    while (it != NULL) {
+        _z_interest_peer_disconnected(session, &_z_transport_peer_multicast_slist_value(it)->common);
+        it = _z_transport_peer_multicast_slist_next(it);
+    }
+    _z_transport_peer_mutex_unlock(&ztm->_common);
 #if Z_FEATURE_LIVELINESS == 1 && Z_FEATURE_SUBSCRIPTION == 1
     _z_liveliness_subscription_undeclare_all(session);
 #endif
