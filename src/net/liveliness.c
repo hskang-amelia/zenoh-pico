@@ -15,6 +15,7 @@
 
 #include "zenoh-pico/net/liveliness.h"
 #include "zenoh-pico/net/primitives.h"
+#include "zenoh-pico/net/reply.h"
 #include "zenoh-pico/protocol/core.h"
 #include "zenoh-pico/protocol/definitions/interest.h"
 #include "zenoh-pico/protocol/definitions/network.h"
@@ -128,6 +129,30 @@ z_result_t _z_undeclare_liveliness_token(_z_liveliness_token_t *token) {
     return ret;
 }
 
+/**************** Remote tokens ****************/
+
+/**
+ * Collect copies of the key expressions of the remote tokens (of all peers) intersecting with keyexpr.
+ * Key expressions declared by several peers are only reported once.
+ *
+ * This function is unsafe because it operates in potentially concurrent data.
+ * Make sure that the following mutexes are locked before calling this function:
+ *  - zn->_mutex_inner
+ */
+static _z_keyexpr_slist_t *_z_unsafe_liveliness_collect_remote_tokens(_z_session_t *zn, const _z_keyexpr_t *keyexpr) {
+    _z_keyexpr_slist_t *tokens_list = _z_keyexpr_slist_new();
+    _z_remote_token_slist_t *xs = zn->_remote_tokens;
+    while (xs != NULL) {
+        const _z_keyexpr_t *token_ke = &_z_remote_token_slist_value(xs)->_key;
+        if (_z_keyexpr_intersects(keyexpr, token_ke) &&
+            _z_keyexpr_slist_find(tokens_list, _z_keyexpr_equals, token_ke) == NULL) {
+            tokens_list = _z_keyexpr_slist_push(tokens_list, token_ke);
+        }
+        xs = _z_remote_token_slist_next(xs);
+    }
+    return tokens_list;
+}
+
 /**************** Liveliness Subscriber ****************/
 
 z_result_t _z_liveliness_subscription_trigger_history(_z_session_t *zn, const _z_subscription_t *sub) {
@@ -143,12 +168,7 @@ z_result_t _z_liveliness_subscription_trigger_history(_z_session_t *zn, const _z
     // i.e. if they arrive during callback execution - they will only be delivered after initial history calls,
     // thus preventing potential declare/undeclare order inversion.
     // TODO: add support for local tokens
-    _z_keyexpr_intmap_iterator_t iter = _z_keyexpr_intmap_iterator_make(&zn->_remote_tokens);
-    while (_z_keyexpr_intmap_iterator_next(&iter)) {
-        if (_z_keyexpr_intersects(&sub->_key._inner, _z_keyexpr_intmap_iterator_value(&iter))) {
-            tokens_list = _z_keyexpr_slist_push(tokens_list, _z_keyexpr_intmap_iterator_value(&iter));
-        }
-    }
+    tokens_list = _z_unsafe_liveliness_collect_remote_tokens(zn, &sub->_key._inner);
     _z_session_mutex_unlock(zn);
 
     _z_keyexpr_slist_t *pos = tokens_list;
@@ -311,11 +331,56 @@ z_result_t _z_liveliness_pending_query_register_cancellation(_z_liveliness_pendi
 }
 #endif
 
+/**
+ * In peer mode without a router, peers push their tokens to each other on connection and on declaration, so the
+ * remote tokens already known by the session are the complete answer to a liveliness query: there is no need to send
+ * an interest (which zenoh-pico peers would not answer with a declare final anyway).
+ */
+static bool _z_liveliness_query_is_local(_z_session_t *zn) {
+    return zn->_mode == Z_WHATAMI_PEER && zn->_tp._type == _Z_TRANSPORT_UNICAST_TYPE && !_z_session_has_router_peer(zn);
+}
+
+static z_result_t _z_liveliness_query_local(_z_session_t *zn, const _z_declared_keyexpr_t *keyexpr,
+                                            _z_closure_reply_callback_t callback, _z_drop_handler_t dropper,
+                                            void *arg) {
+    _Z_DEBUG("Resolve liveliness query for (%.*s) from known remote tokens",
+             (int)_z_string_len(&keyexpr->_inner._keyexpr), _z_string_data(&keyexpr->_inner._keyexpr));
+    _Z_CLEAN_RETURN_IF_ERR(_z_session_mutex_lock_if_open(zn), _z_drop_handler_execute(dropper, arg));
+    _z_keyexpr_slist_t *tokens_list = _z_unsafe_liveliness_collect_remote_tokens(zn, &keyexpr->_inner);
+    _z_session_mutex_unlock(zn);
+
+    // Call user callbacks outside of session mutex
+    _z_keyexpr_slist_t *pos = tokens_list;
+    while (pos != NULL) {
+        _z_keyexpr_t ke = _z_keyexpr_steal(_z_keyexpr_slist_value(pos));
+        _z_encoding_t encoding = _z_encoding_null();
+        _z_bytes_t payload = _z_bytes_null();
+        _z_bytes_t attachment = _z_bytes_null();
+        _z_source_info_t source_info = _z_source_info_null();
+        _z_timestamp_t timestamp = _z_timestamp_null();
+        _z_reply_t reply;
+        _z_reply_steal_data(&reply, &ke, _z_entity_global_id_null(), &payload, &timestamp, &encoding, Z_SAMPLE_KIND_PUT,
+                            &attachment, &source_info);
+        callback(&reply, arg);
+        _z_reply_clear(&reply);
+        pos = _z_keyexpr_slist_next(pos);
+    }
+    _z_keyexpr_slist_free(&tokens_list);
+    // The query is complete
+    _z_drop_handler_execute(dropper, arg);
+    return _Z_RES_OK;
+}
+
 z_result_t _z_liveliness_query(const _z_session_rc_t *session, const _z_declared_keyexpr_t *keyexpr,
                                _z_closure_reply_callback_t callback, _z_drop_handler_t dropper, void *arg,
                                uint64_t timeout_ms, _z_cancellation_token_rc_t *opt_cancellation_token) {
     z_result_t ret = _Z_RES_OK;
     _z_session_t *zn = _Z_RC_IN_VAL(session);
+    if (_z_liveliness_query_is_local(zn)) {
+        _ZP_UNUSED(timeout_ms);
+        _ZP_UNUSED(opt_cancellation_token);
+        return _z_liveliness_query_local(zn, keyexpr, callback, dropper, arg);
+    }
     _Z_DEBUG("Register liveliness query for (%.*s)", (int)_z_string_len(&keyexpr->_inner._keyexpr),
              _z_string_data(&keyexpr->_inner._keyexpr));
 
@@ -337,6 +402,9 @@ z_result_t _z_liveliness_query(const _z_session_rc_t *session, const _z_declared
     pq->_callback = callback;
     pq->_dropper = dropper;
     pq->_arg = arg;
+    // The query is dropped on timeout if no declare final is received in the meantime
+    pq->_start_time = z_clock_now();
+    pq->_timeout = timeout_ms;
 #ifdef Z_FEATURE_UNSTABLE_API
     ret = _z_liveliness_pending_query_register_cancellation(pq, opt_cancellation_token, session);
 #else
@@ -345,7 +413,6 @@ z_result_t _z_liveliness_query(const _z_session_rc_t *session, const _z_declared
     _z_session_mutex_unlock(zn);
 
     if (ret == _Z_RES_OK) {
-        _ZP_UNUSED(timeout_ms);  // Current interest in pico don't support timeout
         _z_wireexpr_t wireexpr = _z_declared_keyexpr_alias_to_wire(keyexpr, zn);
         _z_interest_t interest = _z_make_interest(&wireexpr, query_id,
                                                   _Z_INTEREST_FLAG_KEYEXPRS | _Z_INTEREST_FLAG_TOKENS |

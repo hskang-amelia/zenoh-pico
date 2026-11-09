@@ -20,6 +20,7 @@
 #include "zenoh-pico/net/reply.h"
 #include "zenoh-pico/net/sample.h"
 #include "zenoh-pico/session/keyexpr.h"
+#include "zenoh-pico/session/liveliness.h"
 #include "zenoh-pico/session/resource.h"
 #include "zenoh-pico/session/utils.h"
 #include "zenoh-pico/utils/locality.h"
@@ -65,6 +66,9 @@ _z_fut_fn_result_t _z_pending_query_process_timeout_task_fn(void *session_arg, _
     _ZP_UNUSED(executor);
     _z_session_t *zn = (_z_session_t *)session_arg;
     _z_pending_query_process_timeout(zn);
+#if Z_FEATURE_LIVELINESS == 1
+    _z_liveliness_pending_query_process_timeout(zn);
+#endif
     return _z_fut_fn_result_wake_up_after(1000);
 }
 

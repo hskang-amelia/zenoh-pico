@@ -24,6 +24,7 @@
 #include "zenoh-pico/protocol/definitions/declarations.h"
 #include "zenoh-pico/protocol/definitions/network.h"
 #include "zenoh-pico/session/keyexpr.h"
+#include "zenoh-pico/session/liveliness.h"
 #include "zenoh-pico/session/queryable.h"
 #include "zenoh-pico/session/resource.h"
 #include "zenoh-pico/session/session.h"
@@ -223,11 +224,17 @@ void _z_declare_data_copy(_z_declare_data_t *dst, const _z_declare_data_t *src) 
     dst->_id = src->_id;
     dst->_type = src->_type;
     dst->_peer = src->_peer;
+    dst->_complete = src->_complete;
     _z_keyexpr_copy(&dst->_key, &src->_key);
 }
 
+// Entity ids are only unique per remote node, so a remote declaration is identified by the (peer, id, type) triple.
 bool _z_declare_data_eq(const _z_declare_data_t *left, const _z_declare_data_t *right) {
-    return ((left->_id == right->_id) && (left->_type == right->_type));
+    return ((left->_peer == right->_peer) && (left->_id == right->_id) && (left->_type == right->_type));
+}
+
+static bool _z_declare_data_peer_eq(const _z_declare_data_t *left, const _z_declare_data_t *right) {
+    return left->_peer == right->_peer;
 }
 
 bool _z_session_interest_eq(const _z_session_interest_t *one, const _z_session_interest_t *two) {
@@ -343,9 +350,10 @@ static z_result_t _unsafe_z_register_declare(_z_session_t *zn, const _z_keyexpr_
     return _Z_RES_OK;
 }
 
-static _z_declare_data_t *_unsafe_z_get_declare(_z_session_t *zn, uint32_t id, uint8_t type) {
+static _z_declare_data_t *_unsafe_z_get_declare(_z_session_t *zn, uint32_t id, uint8_t type,
+                                                _z_transport_peer_common_t *peer) {
     _z_declare_data_slist_t *xs = zn->_remote_declares;
-    _z_declare_data_t comp = {._key = _z_keyexpr_null(), ._id = id, ._type = type, ._complete = false};
+    _z_declare_data_t comp = {._key = _z_keyexpr_null(), ._peer = peer, ._id = id, ._type = type, ._complete = false};
     while (xs != NULL) {
         _z_declare_data_t *decl = _z_declare_data_slist_value(xs);
         if (_z_declare_data_eq(&comp, decl)) {
@@ -356,8 +364,9 @@ static _z_declare_data_t *_unsafe_z_get_declare(_z_session_t *zn, uint32_t id, u
     return NULL;
 }
 
-static z_result_t _unsafe_z_unregister_declare(_z_session_t *zn, uint32_t id, uint8_t type) {
-    _z_declare_data_t decl = {._key = _z_keyexpr_null(), ._id = id, ._type = type, ._complete = false};
+static z_result_t _unsafe_z_unregister_declare(_z_session_t *zn, uint32_t id, uint8_t type,
+                                               _z_transport_peer_common_t *peer) {
+    _z_declare_data_t decl = {._key = _z_keyexpr_null(), ._peer = peer, ._id = id, ._type = type, ._complete = false};
     zn->_remote_declares = _z_declare_data_slist_drop_first_filter(zn->_remote_declares, _z_declare_data_eq, &decl);
     return _Z_RES_OK;
 }
@@ -404,7 +413,7 @@ z_result_t _z_interest_process_declares(_z_session_t *zn, const _z_n_msg_declare
     _Z_CLEAN_RETURN_IF_ERR(_z_session_mutex_lock_if_open(zn), _z_keyexpr_clear(&key));
     msg.key = &key;
     // NOTE: it is possible that it is a redeclare of an existing entity - so we might need to update it
-    _z_declare_data_t *prev_decl = _unsafe_z_get_declare(zn, msg.id, decl_type);
+    _z_declare_data_t *prev_decl = _unsafe_z_get_declare(zn, msg.id, decl_type, peer);
     if (prev_decl != NULL) {  // possible change in queryable completness
         prev_decl->_complete = msg.is_complete;
     } else {
@@ -459,7 +468,7 @@ z_result_t _z_interest_process_undeclares(_z_session_t *zn, const _z_declaration
     }
     _Z_RETURN_IF_ERR(_z_session_mutex_lock_if_open(zn));
     // Retrieve declare data
-    _z_declare_data_t *prev_decl = _unsafe_z_get_declare(zn, msg.id, decl_type);
+    _z_declare_data_t *prev_decl = _unsafe_z_get_declare(zn, msg.id, decl_type, peer);
     if (prev_decl == NULL) {
         _z_session_mutex_unlock(zn);
         _Z_ERROR_RETURN(_Z_ERR_MESSAGE_ZENOH_DECLARATION_UNKNOWN);
@@ -467,7 +476,7 @@ z_result_t _z_interest_process_undeclares(_z_session_t *zn, const _z_declaration
     _z_session_interest_rc_slist_t *intrs =
         __unsafe_z_get_interest_by_key_and_flags(zn, flags, &prev_decl->_key, _z_optional_id_make_none());
     // Remove declare
-    _unsafe_z_unregister_declare(zn, msg.id, decl_type);
+    _unsafe_z_unregister_declare(zn, msg.id, decl_type, peer);
     _z_session_mutex_unlock(zn);
 
     // Parse session_interest list
@@ -573,12 +582,17 @@ z_result_t _z_interest_process_interest(_z_session_t *zn, const _z_wireexpr_t *w
 }
 
 void _z_interest_peer_disconnected(_z_session_t *zn, _z_transport_peer_common_t *peer) {
-    // Clone session interest list
+    // Clone session interest list and drop the declarations of the disconnected peer
     if (_z_session_mutex_lock_if_open(zn) != _Z_RES_OK) {
         return;
     }
     _z_session_interest_rc_slist_t *intrs = _z_session_interest_rc_slist_clone(zn->_local_interests);
+    _z_declare_data_t decl = {._key = _z_keyexpr_null(), ._peer = peer, ._id = 0, ._type = 0, ._complete = false};
+    _z_declare_data_slist_t *removed = _z_declare_data_slist_new();
+    zn->_remote_declares =
+        _z_declare_data_slist_extract_all_filter(zn->_remote_declares, &removed, _z_declare_data_peer_eq, &decl);
     _z_session_mutex_unlock(zn);
+    _z_declare_data_slist_free(&removed);
 
     // Parse session_interest list
     _z_interest_msg_t msg = {.id = 0, .type = _Z_INTEREST_MSG_TYPE_CONNECTION_DROPPED};
@@ -592,6 +606,8 @@ void _z_interest_peer_disconnected(_z_session_t *zn, _z_transport_peer_common_t 
     }
     // Clean up
     _z_session_interest_rc_slist_free(&intrs);
+    // Drop the liveliness tokens of the disconnected peer
+    _z_liveliness_peer_disconnected(zn, peer);
 }
 
 void _z_interest_replay_declare(_z_session_t *zn, _z_session_interest_t *interest) {
@@ -677,7 +693,7 @@ z_result_t _z_interest_process_interest(_z_session_t *zn, _z_wireexpr_t *wireexp
 }
 
 void _z_interest_peer_disconnected(_z_session_t *zn, _z_transport_peer_common_t *peer) {
-    _ZP_UNUSED(zn);
-    _ZP_UNUSED(peer);
+    // Drop the liveliness tokens of the disconnected peer
+    _z_liveliness_peer_disconnected(zn, peer);
 }
 #endif
