@@ -36,6 +36,7 @@
 
 #define WAIT_TIMEOUT_MS 5000
 #define LIVELINESS_GET_MAX_MS 1000
+#define TEST_PORT_RANGE 5
 
 #define assert_ok(x)                            \
     {                                           \
@@ -549,9 +550,10 @@ static void test_liveliness_pending_query_timeout(uint16_t port) {
 }
 
 int main(void) {
+    // Distinct ports per test case (TEST_PORT_RANGE), and per process to allow concurrent runs
     const char *port_env = getenv("Z_TEST_BASE_PORT");
-    g_base_port = (port_env != NULL) ? (uint16_t)atoi(port_env) : (uint16_t)(20000 + (getpid() % 20000) * 2);
-    // Distinct ports per test case
+    g_base_port =
+        (port_env != NULL) ? (uint16_t)atoi(port_env) : (uint16_t)(20000 + (getpid() % 9000) * TEST_PORT_RANGE);
     test_tokens_same_id(g_base_port);
     test_token_dropped_on_disconnect((uint16_t)(g_base_port + 1));
     test_queryables_same_id((uint16_t)(g_base_port + 2));
